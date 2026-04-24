@@ -39,36 +39,63 @@ BEST_MODEL_PATH = os.path.join(SAVE_DIR, "best_model.pt")
 CHECKPOINT_PATH = os.path.join(SAVE_DIR, "checkpoint.pt")
 LOG_PATH = os.path.join(ROOT, "train.log")
 
-# ---------- topology ----------
-NUM_RES_BLOCKS = 6
-NUM_CHANNELS = 96
+# ---------- profile (cpu | gpu | auto) ----------
+# Auto-detection: GPU profile if CUDA is present, else CPU.
+PROFILE = os.environ.get("CHESS_PROFILE", "auto").lower()
+if PROFILE == "auto":
+    PROFILE = "gpu" if (os.environ.get("CHESS_FORCE_GPU") == "1") else None  # decide after torch import
 
-# ---------- training schedule ----------
+import torch as _torch  # noqa: E402
+if PROFILE is None:
+    PROFILE = "gpu" if _torch.cuda.is_available() else "cpu"
+
 CPU_COUNT = os.cpu_count() or 4
-NUM_WORKERS = max(1, min(8, CPU_COUNT - 1))
-NUM_ITERATIONS = 80
-GAMES_PER_ITERATION = 16
-EVAL_EVERY = 4
-EVAL_GAMES = 14
-WIN_THRESHOLD = 0.55
 
-# ---------- MCTS budget ----------
-MCTS_SIMS_TRAIN = 40
-MCTS_SIMS_EVAL = 80
-
-# ---------- game limits / resignation ----------
-MAX_GAME_MOVES = 220
-RESIGN_VALUE = -0.92
-RESIGN_STREAK = 5
-
-# ---------- optimization ----------
-BATCH_SIZE = 256
-EPOCHS_PER_ITERATION = 4
-REPLAY_BUFFER_SIZE = 100_000
-LR_INIT = 1e-3
-LR_MIN = 1e-5
-WEIGHT_DECAY = 1e-4
-GRAD_CLIP = 1.0
+if PROFILE == "gpu":
+    # Optimized for a single-GPU Lightning Studio (e.g. T4/A10/L4 + 16-32 CPUs).
+    # Self-play workers still run on CPU to avoid CUDA contention; only training
+    # uses the GPU. This is the standard AlphaZero-on-a-single-machine recipe.
+    NUM_RES_BLOCKS = 10
+    NUM_CHANNELS = 128
+    NUM_WORKERS = max(2, min(16, CPU_COUNT - 2))
+    NUM_ITERATIONS = 200
+    GAMES_PER_ITERATION = 48
+    EVAL_EVERY = 4
+    EVAL_GAMES = 20
+    WIN_THRESHOLD = 0.55
+    MCTS_SIMS_TRAIN = 80
+    MCTS_SIMS_EVAL = 160
+    MAX_GAME_MOVES = 240
+    RESIGN_VALUE = -0.92
+    RESIGN_STREAK = 5
+    BATCH_SIZE = 512
+    EPOCHS_PER_ITERATION = 6
+    REPLAY_BUFFER_SIZE = 250_000
+    LR_INIT = 1e-3
+    LR_MIN = 1e-5
+    WEIGHT_DECAY = 1e-4
+    GRAD_CLIP = 1.0
+else:  # cpu
+    NUM_RES_BLOCKS = 6
+    NUM_CHANNELS = 96
+    NUM_WORKERS = max(1, min(8, CPU_COUNT - 1))
+    NUM_ITERATIONS = 80
+    GAMES_PER_ITERATION = 16
+    EVAL_EVERY = 4
+    EVAL_GAMES = 14
+    WIN_THRESHOLD = 0.55
+    MCTS_SIMS_TRAIN = 40
+    MCTS_SIMS_EVAL = 80
+    MAX_GAME_MOVES = 220
+    RESIGN_VALUE = -0.92
+    RESIGN_STREAK = 5
+    BATCH_SIZE = 256
+    EPOCHS_PER_ITERATION = 4
+    REPLAY_BUFFER_SIZE = 100_000
+    LR_INIT = 1e-3
+    LR_MIN = 1e-5
+    WEIGHT_DECAY = 1e-4
+    GRAD_CLIP = 1.0
 
 
 # A handful of common opening plies for evaluation diversity.
@@ -310,7 +337,9 @@ def train_step(model: ChessNet, optimizer, replay_buffer: deque, device):
 def main():
     mp.set_start_method("spawn", force=True)
     os.makedirs(SAVE_DIR, exist_ok=True)
-    device = torch.device("cpu")
+    device = torch.device("cuda" if (PROFILE == "gpu" and torch.cuda.is_available()) else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     model = ChessNet(NUM_RES_BLOCKS, NUM_CHANNELS).to(device)
     best_model = ChessNet(NUM_RES_BLOCKS, NUM_CHANNELS).to(device)
@@ -353,7 +382,9 @@ def main():
 
     param_count = sum(p.numel() for p in model.parameters())
     log("=" * 60)
-    log("Chess RL Self-Play (AlphaZero-style, CPU)")
+    log(f"Chess RL Self-Play (AlphaZero-style, profile={PROFILE}, train_device={device.type})")
+    if device.type == "cuda":
+        log(f"  GPU: {torch.cuda.get_device_name(0)}")
     log(f"  workers={NUM_WORKERS}  iters={NUM_ITERATIONS}  games/iter={GAMES_PER_ITERATION}")
     log(f"  model: {NUM_RES_BLOCKS} res blocks x {NUM_CHANNELS} ch  ({param_count:,} params)")
     log(f"  MCTS: train={MCTS_SIMS_TRAIN} sims  eval={MCTS_SIMS_EVAL} sims")

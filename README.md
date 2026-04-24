@@ -34,14 +34,33 @@ disown
 
 Resume is automatic from `saved_models/checkpoint.pt`.
 
-## Hyperparameters (CPU defaults)
+## Profiles (CPU vs GPU)
 
-Defined at the top of `train.py`:
+`train.py` auto-detects CUDA and switches profiles. Override with
+`CHESS_PROFILE=cpu` or `CHESS_PROFILE=gpu`.
 
-- 6 res blocks × 96 channels (~10.6M params)
-- 40 MCTS sims for self-play, 80 for evaluation
-- 16 games / iter × 80 iterations
-- Promotion threshold: 55% win-rate vs current best (eval every 4 iters)
+| Setting               | CPU profile    | GPU profile    |
+|-----------------------|----------------|----------------|
+| res blocks × channels | 6 × 96         | 10 × 128       |
+| self-play workers     | min(8, n-1)    | min(16, n-2)   |
+| games / iteration     | 16             | 48             |
+| MCTS sims (train/eval)| 40 / 80        | 80 / 160       |
+| batch size            | 256            | 512            |
+| iterations            | 80             | 200            |
+| replay buffer         | 100k           | 250k           |
 
-For GPU, increase `MCTS_SIMS_TRAIN`, `GAMES_PER_ITERATION`, `BATCH_SIZE`,
-and `NUM_CHANNELS` proportionally.
+Promotion gate: candidate must hit 55% win-rate (incl. half-points for draws)
+against current best across `EVAL_GAMES` MCTS games starting from a small set
+of common openings.
+
+## Run on Lightning AI
+
+In a Studio terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GiridharSalana/chess_agents/main/scripts/lightning_setup.sh | bash
+```
+
+This installs `uv`, sets up a venv with the right (CUDA or CPU) `torch` wheel,
+runs the round-trip + smoke tests, and launches `train.py` under `nohup setsid`
+so it survives terminal disconnect. Logs go to `nohup_train.out` and `train.log`.
