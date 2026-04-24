@@ -33,17 +33,26 @@ cd "${DEST}"
 
 echo "==> python env"
 # Install with CUDA torch wheel if a GPU is present, otherwise the cpu wheel.
+# Important: explicitly point uv at the local .venv, otherwise it will install
+# into whatever conda/system env happens to be active in the Studio shell.
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-  echo "  GPU detected → installing CUDA torch"
-  uv venv --python 3.11
-  uv pip install --index-strategy unsafe-best-match \
+  echo "  GPU detected → installing CUDA torch into local .venv"
+  uv venv --python 3.11 .venv
+  VENV_PY="${DEST}/.venv/bin/python"
+  VIRTUAL_ENV="${DEST}/.venv" uv pip install --python "${VENV_PY}" \
+      --index-strategy unsafe-best-match \
       --extra-index-url https://download.pytorch.org/whl/cu121 \
       torch
-  uv pip install python-chess numpy
+  VIRTUAL_ENV="${DEST}/.venv" uv pip install --python "${VENV_PY}" \
+      python-chess numpy
 else
-  echo "  No GPU → installing CPU torch"
-  uv sync
+  echo "  No GPU → installing CPU torch into local .venv"
+  uv venv --python 3.11 .venv
+  VIRTUAL_ENV="${DEST}/.venv" uv sync
 fi
+
+echo "  installed packages:"
+.venv/bin/python -c "import torch, chess, numpy; print(' torch=', torch.__version__, 'cuda=', torch.cuda.is_available()); print(' chess=', chess.__version__); print(' numpy=', numpy.__version__)"
 
 echo "==> sanity tests"
 .venv/bin/python tests/test_move_encoding.py
