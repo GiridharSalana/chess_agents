@@ -24,41 +24,42 @@ else
 fi
 cd "${DEST}"
 
-echo "==> python env (plain venv + pip; avoids uv/conda interactions on Studios)"
-# Pick the best available python; prefer 3.11 if present.
-PYBIN="$(command -v python3.11 || command -v python3.10 || command -v python3.12 || command -v python3)"
-echo "  using base python: ${PYBIN}"
+echo "==> python env"
+# Lightning Studios enforce a single conda env (no venvs allowed). Install
+# directly into the active python. On a normal box we just use the system
+# python too — keeps the script portable.
+PYBIN="$(command -v python3)"
+echo "  using python: ${PYBIN}"
 "${PYBIN}" --version
 
-# Recreate the venv cleanly.
-rm -rf .venv
-"${PYBIN}" -m venv .venv
-VENV_PY="${DEST}/.venv/bin/python"
-"${VENV_PY}" -m pip install --quiet --upgrade pip wheel
-
-if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-  echo "  GPU detected → installing CUDA torch (cu121)"
-  "${VENV_PY}" -m pip install --quiet \
-      --index-url https://download.pytorch.org/whl/cu121 \
-      torch
+# Check if torch is already installed (Lightning Studios usually have it).
+if "${PYBIN}" -c "import torch" 2>/dev/null; then
+  echo "  torch already present:"
+  "${PYBIN}" -c "import torch; print('  torch=', torch.__version__, 'cuda=', torch.cuda.is_available())"
 else
-  echo "  No GPU → installing CPU torch"
-  "${VENV_PY}" -m pip install --quiet \
-      --index-url https://download.pytorch.org/whl/cpu \
-      torch
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    echo "  GPU detected → installing CUDA torch (cu121)"
+    "${PYBIN}" -m pip install --quiet --index-url https://download.pytorch.org/whl/cu121 torch
+  else
+    echo "  No GPU → installing CPU torch"
+    "${PYBIN}" -m pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+  fi
 fi
-"${VENV_PY}" -m pip install --quiet python-chess numpy
+
+# python-chess + numpy (numpy is virtually always already there).
+"${PYBIN}" -c "import chess" 2>/dev/null || "${PYBIN}" -m pip install --quiet python-chess
+"${PYBIN}" -c "import numpy" 2>/dev/null || "${PYBIN}" -m pip install --quiet numpy
 
 echo "  installed packages:"
-"${VENV_PY}" -c "import torch, chess, numpy; print(' torch=', torch.__version__, 'cuda=', torch.cuda.is_available()); print(' chess=', chess.__version__); print(' numpy=', numpy.__version__)"
+"${PYBIN}" -c "import torch, chess, numpy; print(' torch=', torch.__version__, 'cuda=', torch.cuda.is_available()); print(' chess=', chess.__version__); print(' numpy=', numpy.__version__)"
 
 echo "==> sanity tests"
-.venv/bin/python tests/test_move_encoding.py
-.venv/bin/python tests/smoke_test.py
+"${PYBIN}" tests/test_move_encoding.py
+"${PYBIN}" tests/smoke_test.py
 
 echo "==> launching training (auto profile, detached)"
 mkdir -p saved_models
-nohup setsid .venv/bin/python -u train.py > nohup_train.out 2>&1 < /dev/null &
+nohup setsid "${PYBIN}" -u train.py > nohup_train.out 2>&1 < /dev/null &
 disown
 sleep 3
 
