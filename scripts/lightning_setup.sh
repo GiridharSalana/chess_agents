@@ -16,13 +16,6 @@ nvidia-smi -L 2>/dev/null || echo "(no GPU detected — will use CPU profile)"
 nproc
 free -h | head -2
 
-echo "==> ensuring uv is installed"
-if ! command -v uv >/dev/null 2>&1; then
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  export PATH="${HOME}/.local/bin:${PATH}"
-fi
-uv --version
-
 echo "==> clone or update repo"
 if [ -d "${DEST}/.git" ]; then
   git -C "${DEST}" pull --ff-only
@@ -31,28 +24,33 @@ else
 fi
 cd "${DEST}"
 
-echo "==> python env"
-# Install with CUDA torch wheel if a GPU is present, otherwise the cpu wheel.
-# Important: explicitly point uv at the local .venv, otherwise it will install
-# into whatever conda/system env happens to be active in the Studio shell.
+echo "==> python env (plain venv + pip; avoids uv/conda interactions on Studios)"
+# Pick the best available python; prefer 3.11 if present.
+PYBIN="$(command -v python3.11 || command -v python3.10 || command -v python3.12 || command -v python3)"
+echo "  using base python: ${PYBIN}"
+"${PYBIN}" --version
+
+# Recreate the venv cleanly.
+rm -rf .venv
+"${PYBIN}" -m venv .venv
+VENV_PY="${DEST}/.venv/bin/python"
+"${VENV_PY}" -m pip install --quiet --upgrade pip wheel
+
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-  echo "  GPU detected → installing CUDA torch into local .venv"
-  uv venv --python 3.11 .venv
-  VENV_PY="${DEST}/.venv/bin/python"
-  VIRTUAL_ENV="${DEST}/.venv" uv pip install --python "${VENV_PY}" \
-      --index-strategy unsafe-best-match \
-      --extra-index-url https://download.pytorch.org/whl/cu121 \
+  echo "  GPU detected → installing CUDA torch (cu121)"
+  "${VENV_PY}" -m pip install --quiet \
+      --index-url https://download.pytorch.org/whl/cu121 \
       torch
-  VIRTUAL_ENV="${DEST}/.venv" uv pip install --python "${VENV_PY}" \
-      python-chess numpy
 else
-  echo "  No GPU → installing CPU torch into local .venv"
-  uv venv --python 3.11 .venv
-  VIRTUAL_ENV="${DEST}/.venv" uv sync
+  echo "  No GPU → installing CPU torch"
+  "${VENV_PY}" -m pip install --quiet \
+      --index-url https://download.pytorch.org/whl/cpu \
+      torch
 fi
+"${VENV_PY}" -m pip install --quiet python-chess numpy
 
 echo "  installed packages:"
-.venv/bin/python -c "import torch, chess, numpy; print(' torch=', torch.__version__, 'cuda=', torch.cuda.is_available()); print(' chess=', chess.__version__); print(' numpy=', numpy.__version__)"
+"${VENV_PY}" -c "import torch, chess, numpy; print(' torch=', torch.__version__, 'cuda=', torch.cuda.is_available()); print(' chess=', chess.__version__); print(' numpy=', numpy.__version__)"
 
 echo "==> sanity tests"
 .venv/bin/python tests/test_move_encoding.py
