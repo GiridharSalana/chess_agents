@@ -1,0 +1,20 @@
+# venv
+.venv/
+__pycache__/
+*.pyc
+
+# logs
+*.log
+*.log.old
+nohup_train.out
+nohup_train.out.old
+monitor_train.out
+monitor_train.out.old
+
+# saved models / checkpoints (large)
+saved_models/
+*.pt
+*.pth
+
+# OS
+.DS_Store

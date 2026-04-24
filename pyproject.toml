@@ -1,0 +1,10 @@
+[project]
+name = "chess-agents"
+version = "0.1.0"
+description = "Chess RL agents trained via self-play"
+requires-python = ">=3.10"
+dependencies = [
+    "python-chess",
+    "torch",
+    "numpy",
+]
