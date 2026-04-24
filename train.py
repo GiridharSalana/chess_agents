@@ -59,14 +59,15 @@ if PROFILE == "gpu":
     NUM_CHANNELS = 128
     NUM_WORKERS = 0  # unused on GPU path
     NUM_ITERATIONS = 200
-    CONCURRENT_GAMES = 32
-    GAMES_PER_ITERATION = 64  # processed in 2 concurrent batches of 32
+    CONCURRENT_GAMES = 128         # all played in lockstep, batched on GPU
+    LEAVES_PER_STEP = 8            # leaves per game per inner step (virtual loss)
+    GAMES_PER_ITERATION = 128      # one concurrent batch per iteration
     EVAL_EVERY = 4
-    EVAL_GAMES = 20
+    EVAL_GAMES = 24
     WIN_THRESHOLD = 0.55
-    MCTS_SIMS_TRAIN = 80
-    MCTS_SIMS_EVAL = 160
-    MAX_GAME_MOVES = 240
+    MCTS_SIMS_TRAIN = 64
+    MCTS_SIMS_EVAL = 120
+    MAX_GAME_MOVES = 200
     RESIGN_VALUE = -0.92
     RESIGN_STREAK = 5
     BATCH_SIZE = 1024
@@ -150,6 +151,7 @@ def gpu_self_play(model, device, total_games: int):
             max_moves=MAX_GAME_MOVES,
             temp_schedule_fn=temp_schedule,
             add_root_noise=True,
+            leaves_per_step=LEAVES_PER_STEP,
         )
         for g in per_game:
             all_examples_flat.extend(g)
@@ -167,6 +169,7 @@ def gpu_evaluate(new_model, old_model, device):
         sims_per_move=MCTS_SIMS_EVAL,
         max_moves=MAX_GAME_MOVES,
         openings=EVAL_OPENINGS,
+        leaves_per_step=LEAVES_PER_STEP,
     )
     for i, (res, new_is_white) in enumerate(eval_log):
         tag = "W" if new_is_white else "B"

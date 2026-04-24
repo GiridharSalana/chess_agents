@@ -180,10 +180,14 @@ def _finalize(game: GameSlot) -> None:
 
 
 def _run_sims_for_group(model, device, game_indices, games, sims_per_move,
-                        add_root_noise: bool):
+                        add_root_noise: bool, leaves_per_step: int = 8):
     """Run sims_per_move MCTS sims for each game in `game_indices`, batching
-    leaf evaluations across games in one forward pass per inner step.
-    Mutates games[i].root in place."""
+    leaf evaluations across all games AND across `leaves_per_step` selections
+    per game per inner step. Virtual loss steers concurrent selections away
+    from already-pending nodes within each tree.
+
+    Mutates games[i].root in place.
+    """
     if not game_indices:
         return
 
@@ -194,30 +198,36 @@ def _run_sims_for_group(model, device, game_indices, games, sims_per_move,
     for i, (probs, _v, legal) in zip(game_indices, root_results):
         _expand(games[i].root, probs, legal, add_noise=add_root_noise)
 
-    # remove games whose root is terminal (no legal moves)
     active = [i for i in game_indices if not games[i].root.is_terminal]
 
-    # 2. simulation loop, one leaf per game per inner step
+    # 2. simulation loop. Per inner step we collect up to
+    # `leaves_per_step` leaves *per game* (each protected by virtual loss),
+    # then a single GPU forward processes all of them at once.
     sims_done = {i: 0 for i in active}
     while True:
-        to_eval = []
+        to_eval = []  # (game_idx, leaf, path)
+        any_pending = False
         for i in active:
-            if sims_done[i] >= sims_per_move:
+            need = sims_per_move - sims_done[i]
+            if need <= 0:
                 continue
-            leaf, path = _select(games[i].root)
-            if leaf.is_terminal:
-                _backprop(leaf, -leaf.terminal_value)
-                sims_done[i] += 1
-                continue
-            if leaf.board.is_game_over(claim_draw=True):
-                _mark_terminal(leaf)
-                _backprop(leaf, -leaf.terminal_value)
-                sims_done[i] += 1
-                continue
-            _apply_vl(path)
-            to_eval.append((i, leaf, path))
+            any_pending = True
+            k = min(leaves_per_step, need)
+            for _ in range(k):
+                leaf, path = _select(games[i].root)
+                if leaf.is_terminal:
+                    _backprop(leaf, -leaf.terminal_value)
+                    sims_done[i] += 1
+                    continue
+                if leaf.board.is_game_over(claim_draw=True):
+                    _mark_terminal(leaf)
+                    _backprop(leaf, -leaf.terminal_value)
+                    sims_done[i] += 1
+                    continue
+                _apply_vl(path)
+                to_eval.append((i, leaf, path))
 
-        if not to_eval and all(sims_done[i] >= sims_per_move for i in active):
+        if not any_pending:
             return
         if not to_eval:
             continue
@@ -256,7 +266,8 @@ def _pick_move_from_root(root: Node, temperature: float):
 
 def selfplay_batch(model, device, n_games: int, sims_per_move: int,
                    max_moves: int, temp_schedule_fn,
-                   add_root_noise: bool = True):
+                   add_root_noise: bool = True,
+                   leaves_per_step: int = 8):
     """Play n_games concurrently, batched on `device`. Returns
     (per_game_examples, per_game_lengths, decisive_count)."""
     games = [GameSlot(max_moves) for _ in range(n_games)]
@@ -264,7 +275,8 @@ def selfplay_batch(model, device, n_games: int, sims_per_move: int,
     while any(not g.done for g in games):
         active = [i for i, g in enumerate(games) if not g.done]
         _run_sims_for_group(model, device, active, games, sims_per_move,
-                            add_root_noise=add_root_noise)
+                            add_root_noise=add_root_noise,
+                            leaves_per_step=leaves_per_step)
 
         for i in active:
             game = games[i]
@@ -300,7 +312,8 @@ def selfplay_batch(model, device, n_games: int, sims_per_move: int,
 # ---------------------------------------------------------------------------
 
 def evaluate_batch(new_model, old_model, device, n_games: int,
-                   sims_per_move: int, max_moves: int, openings):
+                   sims_per_move: int, max_moves: int, openings,
+                   leaves_per_step: int = 8):
     """Head-to-head: returns (win_rate_for_new, list_of_(result_str, new_is_white))."""
     games = []
     new_is_white_flags = []
@@ -330,7 +343,8 @@ def evaluate_batch(new_model, old_model, device, n_games: int,
             if not indices:
                 continue
             _run_sims_for_group(mdl, device, indices, games, sims_per_move,
-                                add_root_noise=False)
+                                add_root_noise=False,
+                                leaves_per_step=leaves_per_step)
             for i in indices:
                 game = games[i]
                 if game.done:
