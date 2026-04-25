@@ -51,7 +51,7 @@ if PROFILE is None:
 
 CPU_COUNT = os.cpu_count() or 4
 
-if PROFILE == "gpu":
+if PROFILE in ("gpu", "fast"):
     # Single-process batched self-play that keeps the GPU saturated.
     # Benchmark on T4 showed the small 10x128 net is kernel-launch bound
     # (batch 64 == 14.3k pos/s, batch 256 == 14.7k pos/s). With AMP/fp16 we
@@ -62,21 +62,36 @@ if PROFILE == "gpu":
     NUM_RES_BLOCKS = 12
     NUM_CHANNELS = 160
     NUM_WORKERS = 0  # unused on GPU path
-    NUM_ITERATIONS = 200
-    CONCURRENT_GAMES = 192         # all played in lockstep, batched on GPU
-    LEAVES_PER_STEP = 16           # leaves per game per inner step (virtual loss)
-    GAMES_PER_ITERATION = 192      # one concurrent batch per iteration
-    EVAL_EVERY = 4
-    EVAL_GAMES = 24
+    if PROFILE == "fast":
+        # ~1-hour T4 budget. Smaller everything; still uses AMP+12x160.
+        NUM_ITERATIONS = 60
+        CONCURRENT_GAMES = 128
+        LEAVES_PER_STEP = 16
+        GAMES_PER_ITERATION = 128
+        EVAL_EVERY = 6
+        EVAL_GAMES = 16
+        MCTS_SIMS_TRAIN = 48
+        MCTS_SIMS_EVAL = 96
+        MAX_GAME_MOVES = 180
+        BATCH_SIZE = 1024
+        EPOCHS_PER_ITERATION = 4
+        REPLAY_BUFFER_SIZE = 200_000
+    else:
+        NUM_ITERATIONS = 200
+        CONCURRENT_GAMES = 192         # all played in lockstep, batched on GPU
+        LEAVES_PER_STEP = 16           # leaves per game per inner step (virtual loss)
+        GAMES_PER_ITERATION = 192      # one concurrent batch per iteration
+        EVAL_EVERY = 4
+        EVAL_GAMES = 24
+        MCTS_SIMS_TRAIN = 64
+        MCTS_SIMS_EVAL = 120
+        MAX_GAME_MOVES = 200
+        BATCH_SIZE = 1024
+        EPOCHS_PER_ITERATION = 6
+        REPLAY_BUFFER_SIZE = 300_000
     WIN_THRESHOLD = 0.55
-    MCTS_SIMS_TRAIN = 64
-    MCTS_SIMS_EVAL = 120
-    MAX_GAME_MOVES = 200
     RESIGN_VALUE = -0.92
     RESIGN_STREAK = 5
-    BATCH_SIZE = 1024
-    EPOCHS_PER_ITERATION = 6
-    REPLAY_BUFFER_SIZE = 300_000
     LR_INIT = 1e-3
     LR_MIN = 1e-5
     WEIGHT_DECAY = 1e-4
@@ -404,7 +419,7 @@ def main():
     if PROFILE == "cpu":
         mp.set_start_method("spawn", force=True)
     os.makedirs(SAVE_DIR, exist_ok=True)
-    device = torch.device("cuda" if (PROFILE == "gpu" and torch.cuda.is_available()) else "cpu")
+    device = torch.device("cuda" if (PROFILE in ("gpu", "fast") and torch.cuda.is_available()) else "cpu")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         # Allow TF32 in fp32 paths (helps even when AMP fp16 is also used).
@@ -477,7 +492,7 @@ def main():
         # represent strong play.
         best_model.eval()
         sp_start = time.time()
-        if PROFILE == "gpu":
+        if PROFILE in ("gpu", "fast"):
             examples, lengths, decisive = gpu_self_play(best_model, device, GAMES_PER_ITERATION)
         else:
             examples, lengths, decisive = parallel_self_play(best_model, GAMES_PER_ITERATION)
@@ -512,7 +527,7 @@ def main():
         if it % EVAL_EVERY == 0:
             model.eval()
             log(f"  evaluating candidate vs best ({EVAL_GAMES} games, {MCTS_SIMS_EVAL} sims)...")
-            if PROFILE == "gpu":
+            if PROFILE in ("gpu", "fast"):
                 wr = gpu_evaluate(model, best_model, device)
             else:
                 wr = parallel_evaluate(model, best_model)
