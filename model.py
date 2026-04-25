@@ -112,36 +112,50 @@ def boards_to_batch_tensor(boards) -> torch.Tensor:
     return torch.from_numpy(arr)
 
 
-def move_to_index(move: chess.Move) -> int:
-    """Map a chess.Move to a flat policy index in [0, 4672)."""
-    from_sq = move.from_square
-    to_sq = move.to_square
+_PROMO_MAP = {chess.KNIGHT: 0, chess.BISHOP: 1, chess.ROOK: 2}
+_KNIGHT_DELTAS = {
+    (-2, -1): 0, (-2, 1): 1, (-1, -2): 2, (-1, 2): 3,
+    (1, -2): 4, (1, 2): 5, (2, -1): 6, (2, 1): 7,
+}
+_DIRECTION_MAP = {
+    (1, 0): 0, (1, 1): 1, (0, 1): 2, (-1, 1): 3,
+    (-1, 0): 4, (-1, -1): 5, (0, -1): 6, (1, -1): 7,
+}
+
+# Cache by (from_sq, to_sq, promotion). At most ~2k distinct chess moves
+# exist; the cache fills in the first iter and serves every later call as
+# a single dict lookup.
+_MOVE_INDEX_CACHE: dict = {}
+
+
+def _compute_move_index(from_sq: int, to_sq: int, promotion) -> int:
     dr = (to_sq // 8) - (from_sq // 8)
     dc = (to_sq % 8) - (from_sq % 8)
 
-    if move.promotion and move.promotion != chess.QUEEN:
-        promo_map = {chess.KNIGHT: 0, chess.BISHOP: 1, chess.ROOK: 2}
+    if promotion and promotion != chess.QUEEN:
         direction = 1 + (1 if dc > 0 else (-1 if dc < 0 else 0))
-        plane = 64 + promo_map[move.promotion] * 3 + direction
+        plane = 64 + _PROMO_MAP[promotion] * 3 + direction
     else:
-        knight_deltas = [
-            (-2, -1), (-2, 1), (-1, -2), (-1, 2),
-            (1, -2), (1, 2), (2, -1), (2, 1),
-        ]
-        if (dr, dc) in knight_deltas:
-            plane = 56 + knight_deltas.index((dr, dc))
+        kn = _KNIGHT_DELTAS.get((dr, dc))
+        if kn is not None:
+            plane = 56 + kn
         else:
-            direction_map = {
-                (1, 0): 0, (1, 1): 1, (0, 1): 2, (-1, 1): 3,
-                (-1, 0): 4, (-1, -1): 5, (0, -1): 6, (1, -1): 7,
-            }
-            norm_dr = (1 if dr > 0 else (-1 if dr < 0 else 0))
-            norm_dc = (1 if dc > 0 else (-1 if dc < 0 else 0))
+            norm_dr = 1 if dr > 0 else (-1 if dr < 0 else 0)
+            norm_dc = 1 if dc > 0 else (-1 if dc < 0 else 0)
             dist = max(abs(dr), abs(dc))
-            direction_idx = direction_map.get((norm_dr, norm_dc), 0)
+            direction_idx = _DIRECTION_MAP.get((norm_dr, norm_dc), 0)
             plane = direction_idx * 7 + (dist - 1)
-
     return from_sq * NUM_MOVE_PLANES + plane
+
+
+def move_to_index(move: chess.Move) -> int:
+    """Map a chess.Move to a flat policy index in [0, 4672). Cached."""
+    key = (move.from_square, move.to_square, move.promotion)
+    idx = _MOVE_INDEX_CACHE.get(key)
+    if idx is None:
+        idx = _compute_move_index(*key)
+        _MOVE_INDEX_CACHE[key] = idx
+    return idx
 
 
 def index_to_move(index: int, board: chess.Board) -> chess.Move | None:
