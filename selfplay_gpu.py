@@ -5,9 +5,15 @@ all active games are gathered into one batch and sent to the GPU as a
 single forward pass. This keeps the GPU saturated -- the standard
 single-machine alternative to spawning many CPU workers.
 
-Key idea: virtual loss is applied on the path to each batched leaf so
-multiple in-flight evaluations don't all converge to the same node within
-a single tree (relevant when collecting >1 leaf per game per batch).
+Performance notes:
+- We never store boards on tree nodes. Each game keeps ONE mutable board
+  for MCTS; selection walks down by pushing moves, expansion stores only
+  (move, prior), and we pop the moves back off after backprop. Avoids
+  ~6k python-chess `Board.copy()` calls per move that otherwise dwarf
+  the GPU work.
+- Virtual loss is applied on the path to each batched leaf so multiple
+  in-flight evaluations don't all converge to the same node within a
+  single tree (relevant when collecting >1 leaf per game per batch).
 """
 
 from __future__ import annotations
@@ -17,7 +23,7 @@ import chess
 import torch
 import numpy as np
 
-from model import board_to_tensor, boards_to_batch_tensor, move_to_index, POLICY_SIZE
+from model import boards_to_batch_tensor, board_to_tensor, move_to_index, POLICY_SIZE
 
 
 C_PUCT = 1.5
@@ -26,19 +32,19 @@ DIRICHLET_WEIGHT = 0.25
 
 
 # ---------------------------------------------------------------------------
-# Tree node
+# Tree node (board-free; the board lives on the GameSlot and is mutated
+# along the selection path)
 # ---------------------------------------------------------------------------
 
 class Node:
     __slots__ = (
-        "board", "parent", "move", "children",
+        "parent", "move", "children",
         "visit_count", "value_sum", "prior",
         "is_expanded", "is_terminal", "terminal_value",
         "virtual_loss",
     )
 
-    def __init__(self, board: chess.Board, parent=None, move=None, prior: float = 0.0):
-        self.board = board
+    def __init__(self, parent=None, move=None, prior: float = 0.0):
         self.parent = parent
         self.move = move
         self.children: list[Node] = []
@@ -54,7 +60,6 @@ class Node:
         denom = self.visit_count + self.virtual_loss
         if denom == 0:
             return 0.0
-        # Virtual loss adds pessimism: pretend in-flight sims will lose.
         return (self.value_sum - self.virtual_loss) / denom
 
     def ucb(self, parent_visits: int) -> float:
@@ -63,39 +68,45 @@ class Node:
         )
 
 
-def _mark_terminal(node: Node) -> None:
+def _mark_terminal(node: Node, board: chess.Board) -> None:
     node.is_expanded = True
     node.is_terminal = True
-    res = node.board.result(claim_draw=True)
+    res = board.result(claim_draw=True)
     if res == "1-0":
-        node.terminal_value = 1.0 if node.board.turn == chess.BLACK else -1.0
+        node.terminal_value = 1.0 if board.turn == chess.BLACK else -1.0
     elif res == "0-1":
-        node.terminal_value = 1.0 if node.board.turn == chess.WHITE else -1.0
+        node.terminal_value = 1.0 if board.turn == chess.WHITE else -1.0
     else:
         node.terminal_value = 0.0
 
 
-def _select(root: Node):
+def _select(root: Node, board: chess.Board):
+    """Walk down the tree from `root`, pushing each child's move onto
+    `board` in place. Returns (leaf_node, path_of_nodes). Caller must
+    pop `len(path) - 1` moves once done with the leaf."""
     path = [root]
     node = root
     while node.is_expanded and not node.is_terminal:
         pv = max(node.visit_count, 1)
         node = max(node.children, key=lambda c: c.ucb(pv))
+        board.push(node.move)
         path.append(node)
     return node, path
 
 
 def _expand(node: Node, priors, legal_moves, add_noise: bool = False) -> None:
     if not legal_moves:
-        _mark_terminal(node)
+        # Caller marks terminal with the board it has; here we just flag
+        # expansion so the search loop stops descending.
+        node.is_expanded = True
         return
     if add_noise:
         noise = np.random.dirichlet([DIRICHLET_ALPHA] * len(legal_moves)).astype(np.float32)
         priors = (1.0 - DIRICHLET_WEIGHT) * priors + DIRICHLET_WEIGHT * noise
-    for mv, p in zip(legal_moves, priors):
-        cb = node.board.copy(stack=False)
-        cb.push(mv)
-        node.children.append(Node(cb, parent=node, move=mv, prior=float(p)))
+    # Children store only the move + prior; their board is computed on
+    # demand by walking the path from the root.
+    node.children = [Node(parent=node, move=mv, prior=float(p))
+                     for mv, p in zip(legal_moves, priors)]
     node.is_expanded = True
 
 
@@ -117,6 +128,12 @@ def _undo_vl(path):
         n.virtual_loss -= 1
 
 
+def _pop_path(board: chess.Board, depth: int) -> None:
+    """Undo the moves pushed during selection (one per non-root node in path)."""
+    for _ in range(depth):
+        board.pop()
+
+
 # ---------------------------------------------------------------------------
 # batched NN evaluation
 # ---------------------------------------------------------------------------
@@ -125,8 +142,7 @@ def _undo_vl(path):
 def _batch_evaluate(model, device, boards):
     """Return list of (legal_priors_or_None, value, legal_moves) parallel to `boards`.
 
-    Uses AMP fp16 on CUDA (T4 Tensor Cores) and a single allocation for the
-    input batch instead of per-board tensor stacking.
+    Uses AMP fp16 on CUDA and a single allocation for the input batch.
     """
     if not boards:
         return []
@@ -198,16 +214,19 @@ def _run_sims_for_group(model, device, game_indices, games, sims_per_move,
     per game per inner step. Virtual loss steers concurrent selections away
     from already-pending nodes within each tree.
 
-    Mutates games[i].root in place.
+    Mutates games[i].root and games[i].board (push/pop) in place.
     """
     if not game_indices:
         return
 
-    # 1. fresh root per game; batched root-eval to seed priors
+    # 1. fresh root per game; batched root-eval to seed priors.
     for i in game_indices:
-        games[i].root = Node(games[i].board.copy(stack=False))
+        games[i].root = Node()
     root_results = _batch_evaluate(model, device, [games[i].board for i in game_indices])
     for i, (probs, _v, legal) in zip(game_indices, root_results):
+        if not legal:
+            _mark_terminal(games[i].root, games[i].board)
+            continue
         _expand(games[i].root, probs, legal, add_noise=add_root_noise)
 
     active = [i for i in game_indices if not games[i].root.is_terminal]
@@ -217,7 +236,8 @@ def _run_sims_for_group(model, device, game_indices, games, sims_per_move,
     # then a single GPU forward processes all of them at once.
     sims_done = {i: 0 for i in active}
     while True:
-        to_eval = []  # (game_idx, leaf, path)
+        # (game_idx, leaf_node, path, leaf_board_snapshot, depth_to_pop)
+        to_eval = []
         any_pending = False
         for i in active:
             need = sims_per_move - sims_done[i]
@@ -225,30 +245,49 @@ def _run_sims_for_group(model, device, game_indices, games, sims_per_move,
                 continue
             any_pending = True
             k = min(leaves_per_step, need)
+            board = games[i].board
             for _ in range(k):
-                leaf, path = _select(games[i].root)
+                leaf, path = _select(games[i].root, board)
+                depth = len(path) - 1  # moves pushed onto board
+
                 if leaf.is_terminal:
                     _backprop(leaf, -leaf.terminal_value)
                     sims_done[i] += 1
+                    _pop_path(board, depth)
                     continue
-                if leaf.board.is_game_over(claim_draw=True):
-                    _mark_terminal(leaf)
+
+                # Detect terminal on first encounter (without needing
+                # board.copy(); we already have the live board state).
+                if board.is_game_over(claim_draw=True) or not any(True for _ in board.legal_moves):
+                    _mark_terminal(leaf, board)
                     _backprop(leaf, -leaf.terminal_value)
                     sims_done[i] += 1
+                    _pop_path(board, depth)
                     continue
+
                 _apply_vl(path)
-                to_eval.append((i, leaf, path))
+                # Snapshot the board for this leaf because we need to
+                # restore the live board for the next selection in this
+                # game. This is one copy per leaf, vs the previous
+                # one-copy-per-child-of-every-node.
+                leaf_board = board.copy(stack=False)
+                _pop_path(board, depth)
+                to_eval.append((i, leaf, path, leaf_board))
 
         if not any_pending:
             return
         if not to_eval:
             continue
 
-        results = _batch_evaluate(model, device, [t[1].board for t in to_eval])
-        for (i, leaf, path), (probs, value, legal) in zip(to_eval, results):
+        results = _batch_evaluate(model, device, [t[3] for t in to_eval])
+        for (i, leaf, path, _lb), (probs, value, legal) in zip(to_eval, results):
             _undo_vl(path)
-            _expand(leaf, probs, legal)
-            _backprop(leaf, -value)
+            if not legal:
+                _mark_terminal(leaf, _lb)
+                _backprop(leaf, -leaf.terminal_value)
+            else:
+                _expand(leaf, probs, legal)
+                _backprop(leaf, -value)
             sims_done[i] += 1
 
 
@@ -292,7 +331,8 @@ def selfplay_batch(model, device, n_games: int, sims_per_move: int,
 
         for i in active:
             game = games[i]
-            if game.done:  # terminal-root case set it
+            if game.done or game.root is None or not game.root.children:
+                _finalize(game)
                 continue
             temp = temp_schedule_fn(game.move_count)
             move, policy_target = _pick_move_from_root(game.root, temp)
@@ -340,7 +380,6 @@ def evaluate_batch(new_model, old_model, device, n_games: int,
         new_is_white_flags.append((i // len(openings)) % 2 == 0)
 
     while any(not g.done for g in games):
-        # Group active games by which model is to move.
         new_to_move = []
         old_to_move = []
         for i, g in enumerate(games):
@@ -349,8 +388,6 @@ def evaluate_batch(new_model, old_model, device, n_games: int,
             is_new_turn = (g.board.turn == chess.WHITE) == new_is_white_flags[i]
             (new_to_move if is_new_turn else old_to_move).append(i)
 
-        # Run sims separately per side using its own model, but each in a
-        # single batched pass over all games whose turn it currently is.
         for indices, mdl in ((new_to_move, new_model), (old_to_move, old_model)):
             if not indices:
                 continue
@@ -359,7 +396,8 @@ def evaluate_batch(new_model, old_model, device, n_games: int,
                                 leaves_per_step=leaves_per_step)
             for i in indices:
                 game = games[i]
-                if game.done:
+                if game.done or game.root is None or not game.root.children:
+                    _finalize(game)
                     continue
                 move, _ = _pick_move_from_root(game.root, temperature=0.0)
                 game.board.push(move)
