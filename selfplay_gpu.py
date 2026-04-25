@@ -132,7 +132,7 @@ def _batch_evaluate(model, device, boards):
         return []
     tensors = boards_to_batch_tensor(boards)
     if device.type == "cuda":
-        tensors = tensors.pin_memory().to(device, non_blocking=True)
+        tensors = tensors.to(device, non_blocking=True)
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             logits, values = model(tensors)
         logits = logits.float()
