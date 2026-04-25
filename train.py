@@ -53,15 +53,19 @@ CPU_COUNT = os.cpu_count() or 4
 
 if PROFILE == "gpu":
     # Single-process batched self-play that keeps the GPU saturated.
-    # CONCURRENT_GAMES = how many games are played in lockstep so we can batch
+    # Benchmark on T4 showed the small 10x128 net is kernel-launch bound
+    # (batch 64 == 14.3k pos/s, batch 256 == 14.7k pos/s). With AMP/fp16 we
+    # can run a meaningfully bigger net (12x160) at similar throughput, and
+    # we collect more in-flight leaves per forward pass to amortize Python
+    # overhead. CONCURRENT_GAMES = games played in lockstep so we can batch
     # leaf evaluations across them on every MCTS step.
-    NUM_RES_BLOCKS = 10
-    NUM_CHANNELS = 128
+    NUM_RES_BLOCKS = 12
+    NUM_CHANNELS = 160
     NUM_WORKERS = 0  # unused on GPU path
     NUM_ITERATIONS = 200
-    CONCURRENT_GAMES = 128         # all played in lockstep, batched on GPU
-    LEAVES_PER_STEP = 8            # leaves per game per inner step (virtual loss)
-    GAMES_PER_ITERATION = 128      # one concurrent batch per iteration
+    CONCURRENT_GAMES = 192         # all played in lockstep, batched on GPU
+    LEAVES_PER_STEP = 16           # leaves per game per inner step (virtual loss)
+    GAMES_PER_ITERATION = 192      # one concurrent batch per iteration
     EVAL_EVERY = 4
     EVAL_GAMES = 24
     WIN_THRESHOLD = 0.55
@@ -79,6 +83,7 @@ if PROFILE == "gpu":
     GRAD_CLIP = 1.0
 else:  # cpu
     CONCURRENT_GAMES = 0  # unused
+    LEAVES_PER_STEP = 1   # unused on cpu path
     NUM_RES_BLOCKS = 6
     NUM_CHANNELS = 96
     NUM_WORKERS = max(1, min(8, CPU_COUNT - 1))
@@ -351,29 +356,43 @@ def parallel_evaluate(new_model: ChessNet, old_model: ChessNet) -> float:
 # training step
 # ---------------------------------------------------------------------------
 
-def train_step(model: ChessNet, optimizer, replay_buffer: deque, device):
+def train_step(model: ChessNet, optimizer, replay_buffer: deque, device,
+               scaler: "torch.cuda.amp.GradScaler | None" = None):
     if len(replay_buffer) < BATCH_SIZE:
         return None
 
     indices = np.random.choice(len(replay_buffer), BATCH_SIZE, replace=False)
     batch = [replay_buffer[i] for i in indices]
 
-    states = torch.stack([b[0] for b in batch]).to(device)
-    target_policies = torch.stack([torch.from_numpy(b[1]) for b in batch]).to(device)
+    states = torch.stack([b[0] for b in batch]).to(device, non_blocking=True)
+    target_policies = torch.stack([torch.from_numpy(b[1]) for b in batch]).to(device, non_blocking=True)
     target_values = torch.tensor(
         [b[2] for b in batch], dtype=torch.float32
-    ).unsqueeze(1).to(device)
+    ).unsqueeze(1).to(device, non_blocking=True)
 
-    policy_logits, pred_values = model(states)
-    log_probs = F.log_softmax(policy_logits, dim=1)
-    policy_loss = -(target_policies * log_probs).sum(dim=1).mean()
-    value_loss = F.mse_loss(pred_values, target_values)
-    loss = policy_loss + value_loss
-
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    use_amp = scaler is not None and device.type == "cuda"
+    if use_amp:
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            policy_logits, pred_values = model(states)
+            log_probs = F.log_softmax(policy_logits.float(), dim=1)
+            policy_loss = -(target_policies * log_probs).sum(dim=1).mean()
+            value_loss = F.mse_loss(pred_values.float(), target_values)
+            loss = policy_loss + value_loss
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        policy_logits, pred_values = model(states)
+        log_probs = F.log_softmax(policy_logits, dim=1)
+        policy_loss = -(target_policies * log_probs).sum(dim=1).mean()
+        value_loss = F.mse_loss(pred_values, target_values)
+        loss = policy_loss + value_loss
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        optimizer.step()
     return float(policy_loss.item()), float(value_loss.item())
 
 
@@ -388,10 +407,13 @@ def main():
     device = torch.device("cuda" if (PROFILE == "gpu" and torch.cuda.is_available()) else "cpu")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        # Allow TF32 in fp32 paths (helps even when AMP fp16 is also used).
+        torch.set_float32_matmul_precision("high")
 
     model = ChessNet(NUM_RES_BLOCKS, NUM_CHANNELS).to(device)
     best_model = ChessNet(NUM_RES_BLOCKS, NUM_CHANNELS).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR_INIT, weight_decay=WEIGHT_DECAY)
+    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
 
     start_iter = 1
     total_games = 0
@@ -474,7 +496,7 @@ def main():
         steps_per_epoch = max(1, len(examples) // BATCH_SIZE)
         for _ in range(EPOCHS_PER_ITERATION):
             for _ in range(steps_per_epoch):
-                out = train_step(model, optimizer, replay_buffer, device)
+                out = train_step(model, optimizer, replay_buffer, device, scaler)
                 if out is None:
                     continue
                 pl, vl = out

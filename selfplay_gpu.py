@@ -17,7 +17,7 @@ import chess
 import torch
 import numpy as np
 
-from model import board_to_tensor, move_to_index, POLICY_SIZE
+from model import board_to_tensor, boards_to_batch_tensor, move_to_index, POLICY_SIZE
 
 
 C_PUCT = 1.5
@@ -123,11 +123,23 @@ def _undo_vl(path):
 
 @torch.no_grad()
 def _batch_evaluate(model, device, boards):
-    """Return list of (legal_priors_or_None, value, legal_moves) parallel to `boards`."""
+    """Return list of (legal_priors_or_None, value, legal_moves) parallel to `boards`.
+
+    Uses AMP fp16 on CUDA (T4 Tensor Cores) and a single allocation for the
+    input batch instead of per-board tensor stacking.
+    """
     if not boards:
         return []
-    tensors = torch.stack([board_to_tensor(b) for b in boards]).to(device, non_blocking=True)
-    logits, values = model(tensors)
+    tensors = boards_to_batch_tensor(boards)
+    if device.type == "cuda":
+        tensors = tensors.pin_memory().to(device, non_blocking=True)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            logits, values = model(tensors)
+        logits = logits.float()
+        values = values.float()
+    else:
+        tensors = tensors.to(device)
+        logits, values = model(tensors)
     logits_np = logits.detach().cpu().numpy()
     values_np = values.detach().cpu().numpy().reshape(-1)
 

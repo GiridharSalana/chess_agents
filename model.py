@@ -57,6 +57,43 @@ def board_to_tensor(board: chess.Board) -> torch.Tensor:
     return torch.from_numpy(planes)
 
 
+def fill_board_planes(board: chess.Board, out: np.ndarray) -> None:
+    """In-place version of board_to_tensor, writing into a preallocated
+    (19, 8, 8) float32 numpy slice. Avoids per-board allocation when
+    encoding many boards into one large batch buffer."""
+    out.fill(0.0)
+    piece_map = {
+        chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
+        chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5,
+    }
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if piece is None:
+            continue
+        row, col = divmod(sq, 8)
+        color_offset = 0 if piece.color == chess.WHITE else 6
+        out[piece_map[piece.piece_type] + color_offset, row, col] = 1.0
+    out[12, :, :] = float(board.has_kingside_castling_rights(chess.WHITE))
+    out[13, :, :] = float(board.has_queenside_castling_rights(chess.WHITE))
+    out[14, :, :] = float(board.has_kingside_castling_rights(chess.BLACK))
+    out[15, :, :] = float(board.has_queenside_castling_rights(chess.BLACK))
+    if board.ep_square is not None:
+        row, col = divmod(board.ep_square, 8)
+        out[16, row, col] = 1.0
+    out[17, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
+    out[18, :, :] = min(board.fullmove_number / 100.0, 1.0)
+
+
+def boards_to_batch_tensor(boards) -> torch.Tensor:
+    """Encode a list of boards into a single (N, 19, 8, 8) cpu tensor with
+    one allocation. Preferred when N is large (batched MCTS / training)."""
+    n = len(boards)
+    arr = np.zeros((n, 19, 8, 8), dtype=np.float32)
+    for i, b in enumerate(boards):
+        fill_board_planes(b, arr[i])
+    return torch.from_numpy(arr)
+
+
 def move_to_index(move: chess.Move) -> int:
     """Map a chess.Move to a flat policy index in [0, 4672)."""
     from_sq = move.from_square
@@ -113,7 +150,7 @@ class ResidualBlock(nn.Module):
 class ChessNet(nn.Module):
     """Dual-headed network: policy (move probabilities) + value (win prediction)."""
 
-    def __init__(self, num_res_blocks: int = 6, channels: int = 96):
+    def __init__(self, num_res_blocks: int = 12, channels: int = 160):
         super().__init__()
         self.conv_in = nn.Conv2d(19, channels, 3, padding=1, bias=False)
         self.bn_in = nn.BatchNorm2d(channels)
