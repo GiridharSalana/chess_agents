@@ -80,6 +80,20 @@ def _mark_terminal(node: Node, board: chess.Board) -> None:
         node.terminal_value = 0.0
 
 
+def _mark_terminal_no_claim(node: Node, board: chess.Board) -> None:
+    """Fast terminal marking that avoids threefold-repetition scan.
+
+    Only correct when caller has already confirmed no legal moves exist:
+    the side-to-move is in checkmate (loss) or stalemate (draw).
+    """
+    node.is_expanded = True
+    node.is_terminal = True
+    if board.is_check():
+        node.terminal_value = -1.0  # side-to-move is checkmated
+    else:
+        node.terminal_value = 0.0   # stalemate
+
+
 def _select(root: Node, board: chess.Board):
     """Walk down the tree from `root`, pushing each child's move onto
     `board` in place. Returns (leaf_node, path_of_nodes). Caller must
@@ -256,10 +270,14 @@ def _run_sims_for_group(model, device, game_indices, games, sims_per_move,
                     _pop_path(board, depth)
                     continue
 
-                # Detect terminal on first encounter (without needing
-                # board.copy(); we already have the live board state).
-                if board.is_game_over(claim_draw=True) or not any(True for _ in board.legal_moves):
-                    _mark_terminal(leaf, board)
+                # Cheap terminal detection: only checkmate/stalemate (no
+                # legal moves). is_game_over(claim_draw=True) is O(history)
+                # because of threefold-repetition, so we skip it inside the
+                # MCTS hot loop and let those rare draws be detected at
+                # real-move time on the live game board.
+                has_legal = next(iter(board.legal_moves), None) is not None
+                if not has_legal:
+                    _mark_terminal_no_claim(leaf, board)
                     _backprop(leaf, -leaf.terminal_value)
                     sims_done[i] += 1
                     _pop_path(board, depth)
@@ -283,7 +301,7 @@ def _run_sims_for_group(model, device, game_indices, games, sims_per_move,
         for (i, leaf, path, _lb), (probs, value, legal) in zip(to_eval, results):
             _undo_vl(path)
             if not legal:
-                _mark_terminal(leaf, _lb)
+                _mark_terminal_no_claim(leaf, _lb)
                 _backprop(leaf, -leaf.terminal_value)
             else:
                 _expand(leaf, probs, legal)
